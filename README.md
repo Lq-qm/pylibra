@@ -5,7 +5,7 @@
 | Sessão | Motor | O que faz |
 |---|---|---|
 | 🎙️ **Narração** | [pyvox](pyvox/) | texto entra, voz sai — narração de textos com **Kokoro-82M** (TTS open-source, **100% CPU**) |
-| 📚 **EPUB** | [pylibre](pylibre/) | lê um livro `.epub` e lista os capítulos (título, autores, contagem de palavras, prévia do texto) |
+| 📚 **EPUB** | [pylibre](pylibre/) + [pyvox](pyvox/) | lê um livro `.epub`, lista os capítulos — e **narra** os capítulos escolhidos (um arquivo por capítulo) |
 
 A sessão de narração é a interface gráfica do **pyvox** — um motor de narração que já vem com linha de comando e web (Gradio); o pylibra leva o mesmo motor para o desktop, com a experiência de um aplicativo:
 
@@ -14,7 +14,7 @@ A sessão de narração é a interface gráfica do **pyvox** — um motor de nar
 - **player embutido** (play/pause, seek, volume) — não precisa de player externo;
 - tudo em uma única janela, sem navegador nem terminal.
 
-Em resumo: o pylibra é o **modo desktop dos motores** do projeto — hoje pyvox (narração) e pylibre (EPUB→texto); novas ferramentas entram como novas sessões.
+Em resumo: o pylibra é o **modo desktop dos motores** do projeto — e já os combina: a sessão EPUB lê o livro com o **pylibre** e narra os capítulos com o **pyvox** (livro → texto → voz, numa única janela).
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -46,13 +46,20 @@ Em resumo: o pylibra é o **modo desktop dos motores** do projeto — hoje pyvox
 - ⏹ Cancelar no meio (o áudio parcial continua tocável)
 - ⌨️ `Ctrl+Enter` gera a narração; botão **📂** abre a pasta de saída
 
-**Sessão 📚 EPUB (pylibre)**
+**Sessão 📚 EPUB (pylibre + pyvox)**
 
 - 📚 Escolher um arquivo `.epub` e ver **título + autores** (metadados do livro)
 - 📑 **Lista de capítulos** na ordem de leitura (spine), com contagem de palavras
 - 👀 **Prévia do texto** do capítulo selecionado
 - ⚙️ Leitura em background (livros grandes não travam a interface)
-- (por enquanto só leitura/listagem — a conversão em texto/áudio do livro vem a seguir)
+- 🎙️ **Narrar o capítulo selecionado ou todos os capítulos** (mesmas opções de voz:
+  idioma, narrador/voz, velocidade, WAV/MP3)
+- 📁 Saída em `saida/<livro>/` — um arquivo por capítulo (`01 - Título.wav`),
+  **sem sobrescrever** nada já existente
+- ⏹ Cancelar a narração do livro a qualquer momento (os capítulos prontos e o
+  áudio parcial do capítulo atual são mantidos)
+- 🎧 Cada capítulo pronto carrega no **player** da sessão automaticamente
+- ⚡ O modelo Kokoro é carregado **uma única vez** para o livro inteiro (cache do motor)
 
 ## 📋 Requisitos
 
@@ -90,12 +97,19 @@ pyvox/.venv/bin/python main.py
 ### Linha de comando (sem abrir a janela)
 
 ```bash
+# narra um texto avulso
 pyvox/.venv/bin/python main.py --speak "Olá, mundo!" \
     -l pt-br -g f -o olá.mp3     # → saida/olá.mp3 (voz pf_dora)
+
+# narra um livro EPUB (pylibre → pyvox): todos os capítulos
+pyvox/.venv/bin/python main.py --book livro.epub
+# ou só alguns capítulos (1-based), em MP3, voz masculina:
+pyvox/.venv/bin/python main.py --book livro.epub -c 1,3 -g m -f mp3
 ```
 
 Mesmo motor e mesmas regras da UI (narrador/voz, colisão de saída, MP3 via
-ffmpeg); o progresso aparece no terminal.
+ffmpeg); o progresso aparece no terminal. O `--book` grava um arquivo por
+capítulo em `saida/<livro>/`, na mesma ordem e nomenclatura da sessão EPUB.
 
 > A **1ª narração** baixa o modelo Kokoro-82M (~330 MB) e a voz escolhida do
 > Hugging Face (cache em `~/.cache/huggingface`); nas seguintes o modelo fica
@@ -197,15 +211,16 @@ ou deixar o AppImageLauncher funcional (`systemctl --user status appimagelaunche
 pylibra/
 ├── main.py              # entrada: injeta os motores (pyvox, pylibre) no sys.path e sobe o Qt
 ├── pylibra/
-│   ├── worker.py        # SynthWorker (QThread) + resolução de voz + saída sem colisão
+│   ├── worker.py        # SynthWorker (QThread) + vozes + saída sem colisão (compartilhado)
 │   ├── audio_player.py  # widget player (QMediaPlayer/QAudioOutput)
-│   ├── epub_panel.py    # sessão EPUB: EpubWorker (QThread) + painel de capítulos (pylibre)
+│   ├── book_worker.py   # BookSynthWorker (QThread): narra a fila de capítulos (pylibre→pyvox)
+│   ├── epub_panel.py    # sessão EPUB: leitura (pylibre) + narração (pyvox) + player
 │   └── main_window.py   # UI principal — QTabWidget com as sessões (Narração, EPUB)
 ├── pylibre/             # motor EPUB→texto (REPO INDEPENDENTE, clonado aqui; só stdlib)
 ├── pyvox/               # motor de narração (Kokoro-82M; CLI + web Gradio)
 ├── tests/
 │   ├── e2e_fake.py      # E2E da narração com motor fake (sem baixar modelo)
-│   └── e2e_epub.py      # E2E da sessão EPUB (abrir livro → capítulos → prévia → falha)
+│   └── e2e_epub.py      # E2E da sessão EPUB: leitura + narração do livro (motor fake)
 ├── pylibra.spec         # spec do PyInstaller (coleta de libs nativas/dados)
 ├── AppRun               # entrypoint do AppImage (copiado p/ o payload via --custom-apprun)
 ├── build-release.sh     # build + selftest + tarball da release
@@ -226,6 +241,6 @@ nem durante o carregamento do modelo.
 
 ```bash
 pyvox/.venv/bin/python tests/e2e_fake.py   # narração: sucesso, mp3, cancelamento, falha (motor fake)
-pyvox/.venv/bin/python tests/e2e_epub.py   # EPUB: abrir livro → capítulos → prévia → falha
+pyvox/.venv/bin/python tests/e2e_epub.py   # EPUB: leitura + narrar livro (sucesso, colisão, cancelamento, falha — motor fake)
 pyvox/.venv/bin/python main.py --selftest # motores (pyvox + pylibre) + libs nativas + UI (também no app congelado)
 ```

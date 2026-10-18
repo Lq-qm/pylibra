@@ -17,6 +17,26 @@ import pyvox  # motor — injetado via sys.path pelo main.py
 AUTO = "automática"
 
 
+LANG_LABELS: dict[str, str] = {
+    "pt-br": "Português (Brasil)",
+    "en-us": "Inglês (EUA)",
+    "en-gb": "Inglês (UK)",
+    "es": "Espanhol",
+    "fr-fr": "Francês",
+    "hi": "Hindi",
+    "it": "Italiano",
+    "ja": "Japonês",
+    "zh": "Chinês (Mandarim)",
+}
+
+
+def offline_voices(code: str) -> list[str]:
+    """Pool de vozes offline (padrões + narradores) filtrado pelo código do idioma."""
+    pool = (set(pyvox.DEFAULT_VOICES.values())
+            | {v for d in pyvox.NARRATOR_VOICES.values() for v in d.values()})
+    return sorted(v for v in pool if v.startswith(code))
+
+
 def resolve_voice(lang: str, narrator: str, voice: str) -> str:
     """Resolve a voz final: exata > narrador (m/f) > padrão do idioma.
 

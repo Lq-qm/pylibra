@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""pylibra — interface desktop (PyQt6) do narrador pyvox (Kokoro-82M, CPU).
+"""pylibra — ferramentas de texto e voz (pylibre + pyvox) com interface PyQt6.
 
 Uso:
     pyvox/.venv/bin/python main.py                 # abre a janela do app
-    pyvox/.venv/bin/python main.py --speak "texto" # narra pela linha de comando
-    pyvox/.venv/bin/python main.py --selftest      # verifica motor + libs + UI
+    pyvox/.venv/bin/python main.py --speak "texto" # narra um texto (CLI headless)
+    pyvox/.venv/bin/python main.py --book livro.epub   # narra os capítulos (CLI)
+    pyvox/.venv/bin/python main.py --selftest      # verifica motores + libs + UI
 """
 from __future__ import annotations
 
@@ -199,6 +200,112 @@ def speak_cli(argv: list[str]) -> int:
         return 1
 
 
+def book_cli(argv: list[str]) -> int:
+    """Modo CLI headless: pylibra --book livro.epub [opções].
+
+    Combina os dois motores — pylibre extrai os capítulos do EPUB e o pyvox
+    narra cada um, um arquivo por capítulo em ``saida/<livro>/`` (mesmas regras
+    da UI: resolve_voice + plan_output + sem sobrescrever).
+    """
+    import argparse
+    import zipfile
+
+    from pylibre.epub import read_book
+    from pylibra.book_worker import slugify
+    from pylibra.worker import plan_output, resolve_voice
+
+    p = argparse.ArgumentParser(
+        prog="pylibra --book",
+        description=("Lê um EPUB (pylibre) e narra seus capítulos (pyvox), "
+                     "um arquivo por capítulo."))
+    p.add_argument("epub", help="caminho do arquivo .epub")
+    p.add_argument("-c", "--caps", default=None,
+                   help="capítulos (1-based) separados por vírgula; padrão: todos")
+    p.add_argument("-l", "--lang", default="pt-br", choices=sorted(pyvox.LANGS),
+                   help="idioma (padrão: pt-br)")
+    p.add_argument("-g", "--narrador", default=None,
+                   choices=["auto", "m", "f", "masculino", "feminino"],
+                   help="narrador (padrão: auto = voz padrão do idioma)")
+    p.add_argument("-v", "--voice", default=None,
+                   help="voz exata (ex.: pf_dora) — sobrepõe --narrador")
+    p.add_argument("-s", "--speed", type=float, default=1.0, help="velocidade (padrão: 1.0)")
+    p.add_argument("-t", "--threads", type=int, default=None,
+                   help="threads de CPU (padrão: todos os núcleos)")
+    p.add_argument("-f", "--fmt", default="wav", choices=["wav", "mp3"],
+                   help="formato de saída (padrão: wav)")
+    p.add_argument("-d", "--saida", default="saida",
+                   help="diretório base das saídas (padrão: saida/<livro>)")
+    a = p.parse_args(argv)
+
+    try:
+        with zipfile.ZipFile(a.epub) as zf:
+            book = read_book(zf)
+    except Exception as e:  # noqa: BLE001
+        print(f"erro ao ler o EPUB: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    if a.caps:
+        try:
+            indices = [int(x) - 1 for x in a.caps.split(",") if x.strip()]
+        except ValueError:
+            print("erro: --caps inválido (use ex.: 1,2,3)", file=sys.stderr)
+            return 1
+        if not indices or not all(0 <= i < len(book.chapters) for i in indices):
+            print(f"erro: capítulos fora do intervalo 1..{len(book.chapters)}",
+                  file=sys.stderr)
+            return 1
+    else:
+        indices = list(range(len(book.chapters)))
+
+    narrator = {"m": "masculino", "f": "feminino",
+                "masculino": "masculino", "feminino": "feminino"}.get(a.narrador)
+    try:
+        voice = resolve_voice(a.lang, narrator or "auto", a.voice)
+    except ValueError as e:
+        print(f"erro: {e}", file=sys.stderr)
+        return 1
+
+    outdir = Path(a.saida) / Path(a.epub).stem
+    print(f"livro: {book.title or '(sem título)'} · {len(indices)} capítulo(s) · "
+          f"voz={voice} · {a.lang} · {a.speed}x · {a.fmt.upper()} → {outdir}", flush=True)
+
+    done = 0
+    for pos, idx in enumerate(indices, 1):
+        ch = book.chapters[idx]
+        title = ch.title or f"capitulo-{idx + 1}"
+        text = (ch.text or "").strip()
+        if not text:
+            print(f"[{pos}/{len(indices)}] pulando “{title}” (texto vazio)", flush=True)
+            continue
+        base = f"{pos:02d} - {slugify(title)}"
+        wav = plan_output(outdir, base, a.fmt)
+        try:
+            stats: dict | None = None
+            gen = pyvox.synthesize_stream(
+                text, a.lang, voice, a.speed, str(wav),
+                a.threads or 0, log=lambda line: print(f"[{pos}/{len(indices)}] {line}", flush=True))
+            for item in gen:
+                if isinstance(item, dict):
+                    stats = item
+            if stats is None:
+                print(f"erro: capítulo “{title}” não produziu áudio", file=sys.stderr)
+                return 1
+            final = wav
+            if a.fmt == "mp3":
+                mp3 = wav.with_suffix(".mp3")
+                pyvox.encode_mp3(wav, mp3)
+                wav.unlink(missing_ok=True)
+                final = mp3
+            done += 1
+            print(f"[{pos}/{len(indices)}] ok: {final} "
+                  f"({stats.get('audio_seconds', 0):.1f}s de áudio)", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"erro no capítulo “{title}”: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+    print(f"pronto: {done} arquivo(s) em {outdir}", flush=True)
+    return 0
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         app = QApplication(sys.argv[1:])
@@ -207,6 +314,10 @@ def main() -> int:
     if "--speak" in sys.argv:
         i = sys.argv.index("--speak")
         return speak_cli(sys.argv[i + 1:])
+
+    if "--book" in sys.argv:
+        i = sys.argv.index("--book")
+        return book_cli(sys.argv[i + 1:])
 
     app = QApplication(sys.argv)
     app.setApplicationName("pylibra")

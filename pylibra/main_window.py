@@ -34,34 +34,17 @@ from .audio_player import AudioPlayer
 from .epub_panel import EpubPanel
 from .worker import (
     AUTO,
+    LANG_LABELS,
     SynthWorker,
     VoiceListWorker,
     estimate_warning,
+    offline_voices,
     plan_output,
     resolve_voice,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 SAIDA_DIR = ROOT / "saida"
-
-LANG_LABELS: dict[str, str] = {
-    "pt-br": "Português (Brasil)",
-    "en-us": "Inglês (EUA)",
-    "en-gb": "Inglês (UK)",
-    "es": "Espanhol",
-    "fr-fr": "Francês",
-    "hi": "Hindi",
-    "it": "Italiano",
-    "ja": "Japonês",
-    "zh": "Chinês (Mandarim)",
-}
-
-
-def _offline_voices(code: str) -> list[str]:
-    """Pool de vozes offline (padrões + narradores) filtrado pelo idioma."""
-    pool = (set(pyvox.DEFAULT_VOICES.values())
-            | {v for d in pyvox.NARRATOR_VOICES.values() for v in d.values()})
-    return sorted(v for v in pool if v.startswith(code))
 
 
 class MainWindow(QMainWindow):
@@ -308,7 +291,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ voz/idioma
     def _set_lang(self, lang: str) -> None:
         code = pyvox.LANGS.get(lang, "p")
-        self._fill_voices(_offline_voices(code))
+        self._fill_voices(offline_voices(code))
         self._refresh_voice_list(lang)
 
     def _fill_voices(self, voices: list[str]) -> None:
@@ -533,4 +516,18 @@ class MainWindow(QMainWindow):
             if not self._worker.wait(20_000):
                 self._worker.terminate()
                 self._worker.wait(5_000)
+        # narração do livro (pylibre→pyvox): pergunta, cancela e aguarda
+        if self._epub.book_busy():
+            ret = QMessageBox.question(
+                self, "pylibra",
+                "A narração do livro está em andamento. Sair mesmo assim?\n"
+                "(os capítulos já prontos são mantidos)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                ev.ignore()
+                return
+            self._epub.cancel_book()
+            if not self._epub.wait_book(20_000):
+                pass  # cancel já pedido; encerra mesmo assim
         ev.accept()

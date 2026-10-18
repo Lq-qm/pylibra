@@ -1,32 +1,48 @@
-"""Sessão EPUB do pylibra — lê e lista os capítulos de um .epub via pylibre.
+"""Sessão EPUB do pylibra — lê o livro (pylibre) e narra os capítulos (pyvox).
 
-O motor pylibre (pasta ``pylibre/`` do projeto) usa só a biblioteca padrão;
-aqui ele roda em uma QThread para a interface não travar em livros grandes.
+Dois motores, uma sessão:
+  • pylibre (pasta ``pylibre/`` do projeto, só stdlib) extrai título, autores
+    e capítulos do .epub — roda em QThread para não travar a interface;
+  • pyvox (Kokoro-82M, CPU) narra os capítulos escolhidos, um arquivo por
+    capítulo em ``saida/<livro>/``, sem sobrescrever nada.
 
-Por enquanto a sessão apenas LÊ e LISTA os capítulos (+ prévia do texto);
-a conversão em texto/áudio virá nas próximas sessões.
+O modelo Kokoro é carregado uma única vez (cache do próprio pyvox por idioma).
 """
 from __future__ import annotations
 
 import zipfile
 from pathlib import Path
 
+# motor — injetado via sys.path pelo main.py
+import pyvox
+
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-# motor — injetado via sys.path pelo main.py
-from pylibre.epub import read_book
+from pylibre.epub import read_book  # motor — injetado via sys.path pelo main.py
+
+from .audio_player import AudioPlayer
+from .book_worker import BookSynthWorker
+from .worker import LANG_LABELS, VoiceListWorker, offline_voices
+
+ROOT = Path(__file__).resolve().parents[1]
+SAIDA_DIR = ROOT / "saida"
 
 
 class EpubWorker(QThread):
@@ -68,7 +84,7 @@ class EpubWorker(QThread):
 
 
 class EpubPanel(QWidget):
-    """Abas de trabalho: abrir EPUB → título/autores → lista de capítulos → prévia."""
+    """Abrir EPUB → título/autores → capítulos → prévia → narrar (pyvox)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,6 +93,11 @@ class EpubPanel(QWidget):
         self._worker_gen: int | None = None
         self._data: dict | None = None
         self._gen = 0  # descarta respostas de livros anteriores
+
+        # narração do livro
+        self._book_worker: BookSynthWorker | None = None
+        self._voices_worker: VoiceListWorker | None = None
+        self._voices_lang: str | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 10)
@@ -112,13 +133,123 @@ class EpubPanel(QWidget):
         split.setStretchFactor(1, 3)
         root.addWidget(split, 1)
 
+        # ============================================== narração (pyvox) ===
+        narr = QLabel("<b>🎙️ Narrar com pyvox</b>")
+        root.addWidget(narr)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        # Idioma
+        grid.addWidget(QLabel("Idioma"), 0, 0)
+        self._lang = QComboBox()
+        order = [c for c in ("pt-br", *sorted(pyvox.LANGS)) if c in pyvox.LANGS]
+        for code in order:
+            self._lang.addItem(LANG_LABELS.get(code, code), code)
+        self._lang.setCurrentIndex(self._lang.findData("pt-br"))
+        grid.addWidget(self._lang, 0, 1)
+
+        # Narrador (botões segmentados)
+        grid.addWidget(QLabel("Narrador"), 0, 2)
+        narr_box = QWidget()
+        narr_lay = QHBoxLayout(narr_box)
+        narr_lay.setContentsMargins(0, 0, 0, 0)
+        narr_lay.setSpacing(4)
+        self._narr_group = QButtonGroup(self)
+        self._narr_group.setExclusive(True)
+        self._narr_btns: dict[str, QPushButton] = {}
+        for value, label in (("auto", "Auto"), ("masculino", "Masculino"),
+                             ("feminino", "Feminino")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            self._narr_group.addButton(b)
+            self._narr_btns[value] = b
+            narr_lay.addWidget(b, 1)
+        self._narr_btns["auto"].setChecked(True)
+        grid.addWidget(narr_box, 0, 3)
+
+        # Voz + atualizar
+        grid.addWidget(QLabel("Voz"), 1, 0)
+        voice_lay = QHBoxLayout()
+        voice_lay.setSpacing(4)
+        self._voice = QComboBox()
+        self._voice.addItem("automática")
+        voice_lay.addWidget(self._voice, 1)
+        self._btn_voices = QPushButton("↻")
+        self._btn_voices.setFixedWidth(30)
+        self._btn_voices.setToolTip("Atualizar lista de vozes (Hugging Face)")
+        self._btn_voices.clicked.connect(lambda: self._refresh_voices())
+        voice_lay.addWidget(self._btn_voices)
+        grid.addLayout(voice_lay, 1, 1)
+
+        # Velocidade
+        grid.addWidget(QLabel("Velocidade"), 1, 2)
+        speed_lay = QHBoxLayout()
+        self._speed = QSlider(Qt.Orientation.Horizontal)
+        self._speed.setRange(5, 20)
+        self._speed.setValue(10)
+        self._speed_lbl = QLabel("1.00x")
+        self._speed.valueChanged.connect(
+            lambda v: self._speed_lbl.setText(f"{v / 10:.2f}x"))
+        speed_lay.addWidget(self._speed, 1)
+        speed_lay.addWidget(self._speed_lbl)
+        grid.addLayout(speed_lay, 1, 3)
+
+        # Formato
+        grid.addWidget(QLabel("Formato"), 2, 0)
+        self._fmt = QComboBox()
+        self._fmt.addItem("WAV", "wav")
+        self._fmt.addItem("MP3", "mp3")
+        grid.addWidget(self._fmt, 2, 1)
+
+        root.addLayout(grid)
+
+        # ------------------------------------------- ações + progresso
+        actions = QHBoxLayout()
+        self._btn_chap = QPushButton("🎙️ Narrar este capítulo")
+        self._btn_chap.clicked.connect(lambda: self._narrate([self._current_idx()]))
+        self._btn_all = QPushButton("📚 Narrar todos os capítulos")
+        self._btn_all.clicked.connect(self._narrate_all)
+        self._btn_cancel = QPushButton("⏹ Cancelar")
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.clicked.connect(self._on_cancel)
+        actions.addWidget(self._btn_chap)
+        actions.addWidget(self._btn_all)
+        actions.addWidget(self._btn_cancel)
+        actions.addStretch(1)
+        self._book_progress = QProgressBar()
+        self._book_progress.setRange(0, 1)
+        self._book_progress.setValue(0)
+        self._book_progress.setFixedWidth(160)
+        self._book_progress.setFixedHeight(16)
+        actions.addWidget(self._book_progress)
+        self._prog_lbl = QLabel("")
+        self._prog_lbl.setTextFormat(Qt.TextFormat.RichText)
+        actions.addWidget(self._prog_lbl)
+        root.addLayout(actions)
+
+        # ---------------------------------------------------------------- log
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(2000)
+        self._log.setFixedHeight(100)
+        root.addWidget(self._log)
+
+        # --------------------------------------------------------------- player
+        self._player = AudioPlayer()
+        self._player.error.connect(lambda msg: self._log_append(f"⚠️ player: {msg}"))
+        root.addWidget(self._player)
+
         # ----------------------------------------------------------- status
         self._status = QLabel("aguardando EPUB")
         self._status.setTextFormat(Qt.TextFormat.RichText)
         self._status.setStyleSheet("color: #555;")
         root.addWidget(self._status)
 
-    # ------------------------------------------------------------------ ações
+        self._fill_voices()
+
+    # =================================================================== ações
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Abrir EPUB", str(Path.home()),
@@ -129,6 +260,8 @@ class EpubPanel(QWidget):
 
     def _open_file(self, path: str) -> None:
         """Abre o EPUB (usado pela UI e pelos testes)."""
+        if self.book_busy():
+            return  # narração em andamento — não troca de livro
         if not Path(path).is_file():
             self._set_status(f"⚠️ arquivo não encontrado: {path}")
             return
@@ -149,9 +282,7 @@ class EpubPanel(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.start()
         self._worker = worker
-
-        # guarda a geração no worker p/ o handler comparar
-        self._worker_gen = gen
+        self._worker_gen = gen  # p/ os handlers descartarem respostas antigas
 
     def _on_success(self, data: dict) -> None:
         if getattr(self, "_worker_gen", 0) != self._gen:
@@ -165,7 +296,7 @@ class EpubPanel(QWidget):
         self._meta_lbl.setText(
             f"<b>{data['title']}</b>" + (f" · {', '.join(data['authors'])}"
                                          if data["authors"] else ""))
-        self._data = data  # usado pelo _on_select (prévia)
+        self._data = data  # usado pelo _on_select (prévia) e pela narração
         self._set_status(
             f"✓ <b>{len(chapters)}</b> capítulos · "
             f"<b>{data['total_words']:,}</b> palavras no total")
@@ -178,6 +309,7 @@ class EpubPanel(QWidget):
             return
         self._list.clear()
         self._preview.clear()
+        self._data = None  # não deixar livro anterior "visível" para a narração
         self._btn_open.setEnabled(True)
         self._set_status(f"❌ falha ao ler o EPUB — {msg}")
 
@@ -190,22 +322,195 @@ class EpubPanel(QWidget):
         if data is not None and isinstance(idx, int) and 0 <= idx < len(data["chapters"]):
             self._preview.setPlainText(data["chapters"][idx]["text"])
 
+    def _current_idx(self) -> int | None:
+        row = self._list.currentRow()
+        if row < 0:
+            return None
+        item = self._list.item(row)
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        return idx if isinstance(idx, int) else None
+
+    # ------------------------------------------------------- vozes (pyvox)
+    def _fill_voices(self, voices: list[str] | None = None) -> None:
+        if voices is None:
+            code = pyvox.LANGS.get(self._lang.currentData() or "pt-br", "p")
+            voices = offline_voices(code)
+        current = self._voice.currentText()
+        self._voice.blockSignals(True)
+        self._voice.clear()
+        self._voice.addItem("automática")
+        for v in voices:
+            self._voice.addItem(v)
+        self._voice.setCurrentIndex(max(0, self._voice.findText(current)))
+        self._voice.blockSignals(False)
+
+    def _refresh_voices(self) -> None:
+        lang = self._lang.currentData() or "pt-br"
+        self._voices_lang = lang
+        w = VoiceListWorker(lang, parent=self)
+        w.done.connect(lambda voices: self._on_voice_list(lang, voices))
+        w.done.connect(w.deleteLater)
+        self._voices_worker = w
+        w.start()
+
+    def _on_voice_list(self, lang: str, voices: list[str]) -> None:
+        if self._voices_lang != lang or (self._lang.currentData() or "pt-br") != lang:
+            return  # resposta de uma geração antiga — ignora
+        if voices:
+            self._fill_voices(voices)
+            self._log_append(f"↻ {len(voices)} vozes disponíveis para "
+                             f"{self._lang.currentData()}")
+
+    def _set_narrator(self, value: str) -> None:
+        for v, b in self._narr_btns.items():
+            b.setChecked(v == value)
+
+    # ------------------------------------------------------ narração do livro
+    def _narrate(self, indices: list[int | None]) -> None:
+        self._narrate_range([i for i in indices if isinstance(i, int)])
+
+    def _narrate_all(self) -> None:
+        n = self._list.count() if self._data else 0
+        if n:
+            self._narrate_range(list(range(n)))
+
+    def _narrate_range(self, indices: list[int]) -> None:
+        if self.book_busy():
+            self._log_append("⚠️ já existe uma narração em andamento")
+            return
+        data = self._data
+        if data is None or not self._path or not indices:
+            self._set_status("⚠️ abra um EPUB e escolha ao menos um capítulo")
+            return
+        try:
+            narrator = next(v for v, b in self._narr_btns.items() if b.isChecked())
+        except StopIteration:
+            narrator = "auto"
+        voice = None if self._voice.currentText() == "automática" else self._voice.currentText()
+        lang = self._lang.currentData() or "pt-br"
+        chapters = [
+            (idx, data["chapters"][idx]["title"], data["chapters"][idx]["text"])
+            for idx in indices
+        ]
+        outdir = SAIDA_DIR / Path(self._path).stem
+        n = len(chapters)
+        self._log.clear()
+        self._log_append(
+            f"📚 narrando <b>{n}</b> capítulo(s) — voz {voice or narrator} · "
+            f"{lang} · {self._speed.value() / 10:.2f}x · "
+            f"{self._fmt.currentData().upper()} → {outdir}")
+        self._book_progress.setRange(0, n)
+        self._book_progress.setValue(0)
+        self._set_busy(True)
+
+        w = BookSynthWorker(
+            chapters=chapters, lang=lang, narrator=narrator, voice=voice,
+            speed=self._speed.value() / 10, threads=0,
+            fmt=self._fmt.currentData(), outdir=outdir, parent=self)
+        w.chapter_started.connect(self._on_chapter_started)
+        w.chapter_done.connect(self._on_chapter_done)
+        w.log_line.connect(self._log_append)
+        w.progress.connect(self._log_append)
+        w.succeeded.connect(self._on_book_done)
+        w.cancelled.connect(self._on_book_cancelled)
+        w.failed.connect(self._on_book_failed)
+        w.finished.connect(w.deleteLater)
+        w.start()
+        self._book_worker = w
+
+    def _on_chapter_started(self, i: int, n: int, title: str) -> None:
+        self._book_progress.setValue(i - 1)
+        self._prog_lbl.setText(f"capítulo <b>{i}/{n}</b> — {title}")
+
+    def _on_chapter_done(self, i: int, n: int, path: str) -> None:
+        self._book_progress.setValue(i)
+        self._log_append(f"✅ [{i}/{n}] → {path}")
+        self._player.load(path, autoplay=False)
+        self._prog_lbl.setText(
+            f"capítulo <b>{i}/{n}</b> pronto — {Path(path).name}"
+            + ("" if i == n else " · narrando próximo…"))
+
+    def _on_book_done(self, paths: list[str]) -> None:
+        self._set_busy(False)
+        self._set_status(
+            f"✓ livro narrado — <b>{len(paths)}</b> arquivo(s) em "
+            f"<code>{self._outdir()}</code>")
+        self._log_append(f"🏁 tudo pronto — {len(paths)} arquivo(s)")
+
+    def _on_book_cancelled(self, paths: list[str]) -> None:
+        self._set_busy(False)
+        self._set_status(
+            f"⏹ cancelado — <b>{len(paths)}</b> capítulo(s) pronto(s) em "
+            f"<code>{self._outdir()}</code>")
+
+    def _on_book_failed(self, msg: str) -> None:
+        self._set_busy(False)
+        self._set_status(f"❌ falha na narração — {msg}")
+        self._log_append(f"❌ {msg}")
+
+    def _on_cancel(self) -> None:
+        if self._book_worker is not None:
+            self._book_worker.cancel()
+            self._log_append("⏹ cancelando (para no próximo chunk)…")
+
+    def _set_busy(self, busy: bool) -> None:
+        for w in (self._btn_chap, self._btn_all, self._btn_open):
+            w.setEnabled(not busy)
+        self._btn_cancel.setEnabled(busy)
+        self._list.setEnabled(not busy)
+
+    def _outdir(self) -> str:
+        return str(SAIDA_DIR / Path(self._path).stem) if self._path else str(SAIDA_DIR)
+
+    def _log_append(self, html: str) -> None:
+        self._log.appendPlainText(html.replace("<b>", "").replace("</b>", ""))
+
     def _set_status(self, html: str) -> None:
         self._status.setText(html)
+
+    # ------------------------------------------------------- estado (fechar)
+    def book_busy(self) -> bool:
+        w = self._book_worker
+        if w is None:
+            return False
+        try:
+            return w.isRunning()
+        except RuntimeError:
+            return False
+
+    def cancel_book(self) -> None:
+        if self._book_worker is not None:
+            self._book_worker.cancel()
+
+    def wait_book(self, timeout_ms: int = 20_000) -> bool:
+        w = self._book_worker
+        if w is None:
+            return True
+        try:
+            return w.wait(timeout_ms)
+        except RuntimeError:
+            return True
 
     # -------------------------------------------------------------- para testes
     def chapters(self) -> list[str]:
         return [self._list.item(i).text() for i in range(self._list.count())]
 
     def is_busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        try:
+            return self._worker is not None and self._worker.isRunning()
+        except RuntimeError:
+            return False
 
     def wait_done(self, timeout_ms: int = 15000) -> bool:
-        """Espera (em testes) o worker terminar."""
+        """Espera (em testes) o worker de leitura terminar."""
         import time
+        from PyQt6.QtCore import QCoreApplication
         t0 = time.monotonic()
         while self.is_busy() and time.monotonic() - t0 < timeout_ms / 1000:
-            self.window().processEvents()
+            QCoreApplication.processEvents()
             time.sleep(0.02)
-        self.window().processEvents()
+        QCoreApplication.processEvents()
         return not self.is_busy()
+
+
+
