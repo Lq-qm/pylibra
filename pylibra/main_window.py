@@ -1,4 +1,5 @@
-"""Janela principal do pylibra — interface desktop do narrador pyvox (Kokoro-82M)."""
+"""Janela principal do pylibra — interface desktop dos motores pyvox (narração)
+e pylibre (EPUB → texto), organizadas em sessões/abas."""
 from __future__ import annotations
 
 import os
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -29,6 +31,7 @@ from PyQt6.QtWidgets import (
 import pyvox  # motor — injetado via sys.path pelo main.py
 
 from .audio_player import AudioPlayer
+from .epub_panel import EpubPanel
 from .worker import (
     AUTO,
     SynthWorker,
@@ -64,7 +67,7 @@ def _offline_voices(code: str) -> list[str]:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("pylibra — narrador de textos (Kokoro-82M, CPU)")
+        self.setWindowTitle("pylibra — ferramentas de texto e voz (pyvox + pylibre)")
         self.resize(1100, 740)
 
         self.cancel_event = threading.Event()
@@ -73,6 +76,7 @@ class MainWindow(QMainWindow):
         self._voices_lang: str | None = None  # guarda a geração da busca de vozes
         self._file_stem: str | None = None    # nome do arquivo aberto (base da saída)
 
+        self._epub = EpubPanel()
         self._build_ui()
         self._set_lang(self._lang.currentData() or "pt-br")
         self._lang.currentIndexChanged.connect(
@@ -281,7 +285,11 @@ class MainWindow(QMainWindow):
         # Montagem
         root.addWidget(left_w, 3)
         root.addWidget(right_w, 2)
-        self.setCentralWidget(central)
+        # ------------------------------------------------------- sessões (abas)
+        tabs = QTabWidget(self)
+        tabs.addTab(central, "🎙️ Narração (pyvox)")
+        tabs.addTab(self._epub, "📚 EPUB (pylibre)")
+        self.setCentralWidget(tabs)
 
         # Barra de status
         self._model_lbl = QLabel("modelo: não carregado")
@@ -485,14 +493,33 @@ class MainWindow(QMainWindow):
         self._btn_cancel.setEnabled(running)
 
     # ------------------------------------------------------------------ saída
+    @staticmethod
+    def _thread_running(thread) -> bool:
+        """isRunning() tolerante: o objeto C++ pode já ter sido deletado (deleteLater)."""
+        if thread is None:
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            return False
+
     def closeEvent(self, ev) -> None:
+        # worker EPUB (leitura): aguarda terminar — leitura é rápida e sem rede.
+        # (wait() puro, sem bombear eventos: evita race com deleteLater de outros workers)
+        epub_worker = getattr(self._epub, "_worker", None)
+        if epub_worker is not None:
+            try:
+                if epub_worker.isRunning():
+                    epub_worker.wait(3_000)
+            except RuntimeError:
+                pass  # C++ já deletado (deleteLater) — nada a fazer
         # worker de vozes (rede): aguarda pouco e mata se travado — evita
         # "QThread: Destroyed while thread is still running" ao sair
-        if self._voices_worker is not None and self._voices_worker.isRunning():
+        if self._thread_running(self._voices_worker):
             if not self._voices_worker.wait(3_000):
                 self._voices_worker.terminate()
                 self._voices_worker.wait(1_000)
-        if self._worker is not None and self._worker.isRunning():
+        if self._thread_running(self._worker):
             ret = QMessageBox.question(
                 self, "pylibra",
                 "A síntese está em andamento. Sair mesmo assim?\n"

@@ -1,22 +1,12 @@
-# === Instale PRIMEIRO o PyTorch CPU-only (senão baixa a versão CUDA): ===
-#   uv pip install -i https://download.pytorch.org/whl/cpu torch
-#   pip  install -i https://download.pytorch.org/whl/cpu torch
-torch>=2.0+cpu
+# pylibra — dependências da interface desktop
+# O motor (torch CPU, kokoro, soundfile, pydub, …) vem do requirements.txt do pyvox.
 
-# Kokoro TTS (motor de síntese de fala)
-kokoro>=0.9.4,<1
+PyQt6>=6.6
 
-# Pins compatíveis (validados): transformers 5.x exige huggingface_hub v1,
-# que emite warning ruidoso de token; mantemos o combo estável:
-transformers>=4.50,<5
-huggingface_hub>=0.34,<0.35
+# G2P em inglês (misaki/en.py) usa o modelo spacy en_core_web_sm —
+# instalar uma vez (wheel do GitHub):
+#   uv pip install --python pyvox/.venv/bin/python \
+#     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
-# Escrita de WAV
-soundfile>=0.12.0
-
-# Conversão WAV → MP3 (usa o ffmpeg do sistema; instale o ffmpeg se faltar)
-pydub>=0.25
-
-# Interface web (Gradio). Instale DEPOIS dos pins acima: o gradio depende
-# de huggingface-hub e pode tentar puxar a v1.x, quebrando o pin <0.35.
-gradio>=6
+# release standalone (executável onedir sem venv):
+#   uv pip install --python pyvox/.venv/bin/python pyinstaller
