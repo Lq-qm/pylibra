@@ -37,9 +37,12 @@ from .worker import (
     LANG_LABELS,
     SynthWorker,
     VoiceListWorker,
+    audio_seconds_from_line,
+    estimate_audio_seconds,
     estimate_warning,
     offline_voices,
     plan_output,
+    progress_percent,
     resolve_voice,
 )
 
@@ -119,9 +122,10 @@ class MainWindow(QMainWindow):
 
         # --- progresso + log
         self._progress = QProgressBar()
-        self._progress.setRange(0, 0)  # indeterminado
+        self._progress.setRange(0, 100)  # percentual (denominador: estimativa de duração)
         self._progress.setFixedHeight(14)
         self._progress.setVisible(False)
+        self._progress_est = 0.0  # segundos de áudio estimados para o texto atual
         left.addWidget(self._progress)
 
         self._progress_line = QLabel("")
@@ -401,6 +405,11 @@ class MainWindow(QMainWindow):
         self._log("─" * 64)
         self._log(f"▶ iniciando — voz {voice} · {lang} · {self._speed_value():.2f}x · "
                   f"{len(text):,} chars · formato {fmt.upper()} → {out_wav.name}")
+        # barra: 0–100 com denominador estimado (palavras × s/palavra); avança
+        # com os segundos de áudio reais que o motor vai yieldando por chunk
+        self._progress_est = estimate_audio_seconds(text)
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
         self._progress.setVisible(True)
         self._progress_line.setText("iniciando… (na 1ª vez o modelo ~330 MB é baixado)")
         self._result_lbl.setText("gerando…")
@@ -466,8 +475,12 @@ class MainWindow(QMainWindow):
     def _on_progress(self, line: str) -> None:
         self._log(line)
         self._progress_line.setText(line)
+        sec = audio_seconds_from_line(line)
+        if sec is not None:
+            self._progress.setValue(progress_percent(sec, self._progress_est))
 
     def _on_succeeded(self, stats: dict, path: str) -> None:
+        self._progress.setValue(100)
         self._progress.setVisible(False)
         self._model_loading = False  # garante: se terminou, o modelo está em memória
         self._update_model_lbl()

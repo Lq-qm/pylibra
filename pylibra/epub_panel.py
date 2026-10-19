@@ -39,7 +39,13 @@ from pylibre.epub import read_book  # motor — injetado via sys.path pelo main.
 
 from .audio_player import AudioPlayer
 from .book_worker import BookSynthWorker
-from .worker import LANG_LABELS, VoiceListWorker, offline_voices
+from .worker import (
+    LANG_LABELS,
+    VoiceListWorker,
+    audio_seconds_from_line,
+    estimate_audio_seconds,
+    offline_voices,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SAIDA_DIR = ROOT / "saida"
@@ -99,6 +105,10 @@ class EpubPanel(QWidget):
         self._voices_worker: VoiceListWorker | None = None
         self._voices_lang: str | None = None
         self._model_hook = None  # callback do app: "loading"|"ready" → barra de status
+        # estado da barra de progresso do livro (definidos em _narrate_range)
+        self._book_est: list[float] = []   # estimativa de duração (s) por capítulo
+        self._book_n = 0                   # total de capítulos na fila
+        self._book_i = 0                   # capítulo atual (1-based)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 10)
@@ -220,7 +230,7 @@ class EpubPanel(QWidget):
         actions.addWidget(self._btn_cancel)
         actions.addStretch(1)
         self._book_progress = QProgressBar()
-        self._book_progress.setRange(0, 1)
+        self._book_progress.setRange(0, 100)  # contínuo: capítulos prontos + fração do atual
         self._book_progress.setValue(0)
         self._book_progress.setFixedWidth(160)
         self._book_progress.setFixedHeight(16)
@@ -400,7 +410,12 @@ class EpubPanel(QWidget):
             f"📚 narrando <b>{n}</b> capítulo(s) — voz {voice or narrator} · "
             f"{lang} · {self._speed.value() / 10:.2f}x · "
             f"{self._fmt.currentData().upper()} → {outdir}")
-        self._book_progress.setRange(0, n)
+        # barra contínua: 100/n por capítulo; dentro do capítulo, avança com o
+        # áudio real yieldado (est. de duração por capítulo como denominador)
+        self._book_est = [estimate_audio_seconds(text) for (_i, _t, text) in chapters]
+        self._book_n = n
+        self._book_i = 0  # capítulo atual (1-based), atualizado em chapter_started
+        self._book_progress.setRange(0, 100)
         self._book_progress.setValue(0)
         self._set_busy(True)
 
@@ -411,7 +426,7 @@ class EpubPanel(QWidget):
         w.chapter_started.connect(self._on_chapter_started)
         w.chapter_done.connect(self._on_chapter_done)
         w.log_line.connect(self._on_book_log)
-        w.progress.connect(self._log_append)
+        w.progress.connect(self._on_book_progress)
         w.succeeded.connect(self._on_book_done)
         w.cancelled.connect(self._on_book_cancelled)
         w.failed.connect(self._on_book_failed)
@@ -420,19 +435,39 @@ class EpubPanel(QWidget):
         self._book_worker = w
 
     def _on_chapter_started(self, i: int, n: int, title: str) -> None:
-        self._book_progress.setValue(i - 1)
+        self._book_i = i
+        self._book_n = n
+        self._update_book_progress(None)
         self._prog_lbl.setText(f"capítulo <b>{i}/{n}</b> — {title}")
 
     def _on_chapter_done(self, i: int, n: int, path: str) -> None:
-        self._book_progress.setValue(i)
+        self._book_i = i
+        self._book_n = n
+        self._book_progress.setValue(min(99, int(i / n * 100)))
         self._log_append(f"✅ [{i}/{n}] → {path}")
         self._player.load(path, autoplay=False)
         self._prog_lbl.setText(
             f"capítulo <b>{i}/{n}</b> pronto — {Path(path).name}"
             + ("" if i == n else " · narrando próximo…"))
 
+    def _on_book_progress(self, line: str) -> None:
+        """Linha de chunk do motor: loga e avança a barra (capítulo atual + fração)."""
+        self._log_append(line)
+        self._update_book_progress(audio_seconds_from_line(line))
+
+    def _update_book_progress(self, sec_atual: float | None) -> None:
+        """Barra 0–100: (capítulos prontos + fração do atual) / total."""
+        n = self._book_n or len(self._book_est)
+        if not n:
+            return
+        i = max(1, min(self._book_i or 1, n))
+        est = self._book_est[i - 1] if i <= len(self._book_est) else 0.0
+        frac = min(1.0, sec_atual / est) if (sec_atual and est > 0) else 0.0
+        self._book_progress.setValue(min(99, int((i - 1 + frac) / n * 100)))
+
     def _on_book_done(self, paths: list[str]) -> None:
         self._set_busy(False)
+        self._book_progress.setValue(100)
         self._notify_model("ready")
         self._set_status(
             f"✓ livro narrado — <b>{len(paths)}</b> arquivo(s) em "

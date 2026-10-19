@@ -7,6 +7,7 @@ app Gradio do pyvox): interrompe no próximo chunk e mantém o áudio parcial.
 """
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 
@@ -85,6 +86,41 @@ def estimate_warning(text: str) -> str | None:
     est_cpu = est_audio * 0.3
     return (f"texto longo ({n:,} chars) — estimativa: ~{est_audio / 60:.0f} min de áudio, "
             f"~{est_cpu / 60:.0f} min de CPU")
+
+
+# ------------------------------------------------------------------ progresso
+# O KPipeline não anuncia o total de chunks/duração antes de começar a gerar:
+# cada linha de progresso traz só o acumulado real (“N.Ns de áudio”). Para a
+# barra ter percentual, usamos uma estimativa de duração total (palavras ×
+# segundos/palavra) como denominador — o numerador é o acumulado real.
+_SECONDS_PER_WORD = 0.40            # ≈2,5 palavras/s (taxa típica do Kokoro)
+_MIN_ESTIMATE_SECONDS = 1.0
+_AUDIO_SECONDS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*s de áudio")
+
+
+def estimate_audio_seconds(text: str) -> float:
+    """Estima a duração total do áudio (s) a partir do texto (denominador da barra)."""
+    words = len(text.split())
+    return max(_MIN_ESTIMATE_SECONDS, words * _SECONDS_PER_WORD)
+
+
+def audio_seconds_from_line(line: str) -> float | None:
+    """Segundos de áudio acumulados em uma linha de progresso do pyvox
+    (ex.: ``“[   12]    18.9s de áudio |  3.1s cpu | …”``).``"""
+    m = _AUDIO_SECONDS_RE.search(line or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def progress_percent(audio_seconds: float | None, estimated_total: float) -> int:
+    """Percentual 0–99 para exibição durante a síntese (100% só ao terminar)."""
+    if not audio_seconds or estimated_total <= 0:
+        return 0
+    return max(0, min(99, int(audio_seconds / estimated_total * 100)))
 
 
 class SynthWorker(QThread):
