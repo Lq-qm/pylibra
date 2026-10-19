@@ -8,4 +8,4 @@ ponto de entrada ``main.py``:
 As sessões da interface combinam os dois: a sessão EPUB lê o livro com o
 pylibre e narra os capítulos com o pyvox.
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"

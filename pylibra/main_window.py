@@ -58,9 +58,11 @@ class MainWindow(QMainWindow):
         self._voices_worker: VoiceListWorker | None = None
         self._voices_lang: str | None = None  # guarda a geração da busca de vozes
         self._file_stem: str | None = None    # nome do arquivo aberto (base da saída)
+        self._model_loading = False           # "carregando…" (transitório; o resto vem do cache)
 
         self._epub = EpubPanel()
         self._build_ui()
+        self._epub.set_model_hook(self._on_epub_model)
         self._set_lang(self._lang.currentData() or "pt-br")
         self._lang.currentIndexChanged.connect(
             lambda: self._set_lang(self._lang.currentData() or "pt-br"))
@@ -274,9 +276,14 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._epub, "📚 EPUB (pylibre)")
         self.setCentralWidget(tabs)
 
-        # Barra de status
-        self._model_lbl = QLabel("modelo: não carregado")
+        # Barra de status — estado do Kokoro-82M em memória (fonte: cache do pyvox)
+        self._model_lbl = QLabel("")
+        self._model_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._model_lbl.setToolTip(
+            "Estado do modelo Kokoro-82M neste processo: uma instância por idioma, "
+            "carregada na 1ª narração e reusada em todas as seguintes (inclusive na sessão EPUB).")
         self.statusBar().addPermanentWidget(self._model_lbl)
+        self._update_model_lbl()
 
         # Atalho
         QShortcut(QKeySequence("Ctrl+Return"), self, activated=self._on_run)
@@ -417,14 +424,44 @@ class MainWindow(QMainWindow):
         self._btn_cancel.setEnabled(False)
         self._progress_line.setText("cancelando…")
 
+    # ------------------------------------------------- estado do modelo (barra)
+    @staticmethod
+    def _model_langs() -> list[str]:
+        """Idiomas com pipeline Kokoro em memória (cache real do pyvox)."""
+        pipes = getattr(pyvox, "_PIPELINES", None) or {}
+        reverse = {code: name for name, code in pyvox.LANGS.items()}
+        return sorted(reverse.get(code, code) for code in pipes)
+
+    def _update_model_lbl(self) -> None:
+        if self._model_loading:
+            self._model_lbl.setText(
+                "<span style=\"color:#b45309;font-weight:600\">⏳ Kokoro-82M: carregando…</span>")
+            return
+        langs = self._model_langs()
+        if langs:
+            self._model_lbl.setText(
+                "<span style=\"color:#15803d;font-weight:600\">✓ Kokoro-82M em memória"
+                f" ({', '.join(langs)})</span>")
+        else:
+            self._model_lbl.setText(
+                "<span style=\"color:#6b7280\">○ Kokoro-82M: não carregado "
+                "(baixa na 1ª narração)</span>")
+
+    def _on_epub_model(self, state: str) -> None:
+        """Callback da sessão EPUB: 'loading' | 'ready'."""
+        self._model_loading = (state == "loading")
+        self._update_model_lbl()
+
     # ------------------------------------------------- sinais do worker
     def _on_log_line(self, msg: str) -> None:
         self._log(msg)
         self._progress_line.setText(msg)
         if "carregando modelo" in msg:
-            self._model_lbl.setText("modelo: carregando…")
+            self._model_loading = True
+            self._update_model_lbl()
         elif "modelo pronto" in msg:
-            self._model_lbl.setText("modelo: em cache ✓")
+            self._model_loading = False
+            self._update_model_lbl()
 
     def _on_progress(self, line: str) -> None:
         self._log(line)
@@ -432,6 +469,8 @@ class MainWindow(QMainWindow):
 
     def _on_succeeded(self, stats: dict, path: str) -> None:
         self._progress.setVisible(False)
+        self._model_loading = False  # garante: se terminou, o modelo está em memória
+        self._update_model_lbl()
         self._log(f"✅ pronto — {stats['audio_seconds']:.1f}s de áudio · {stats['chunks']} chunks · "
                   f"{stats['elapsed']:.1f}s de CPU (RTF {stats['rtf']:.2f})")
         self._log(f"📁 salvo em: {path}")

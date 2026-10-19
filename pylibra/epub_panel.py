@@ -98,6 +98,7 @@ class EpubPanel(QWidget):
         self._book_worker: BookSynthWorker | None = None
         self._voices_worker: VoiceListWorker | None = None
         self._voices_lang: str | None = None
+        self._model_hook = None  # callback do app: "loading"|"ready" → barra de status
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 10)
@@ -409,7 +410,7 @@ class EpubPanel(QWidget):
             fmt=self._fmt.currentData(), outdir=outdir, parent=self)
         w.chapter_started.connect(self._on_chapter_started)
         w.chapter_done.connect(self._on_chapter_done)
-        w.log_line.connect(self._log_append)
+        w.log_line.connect(self._on_book_log)
         w.progress.connect(self._log_append)
         w.succeeded.connect(self._on_book_done)
         w.cancelled.connect(self._on_book_cancelled)
@@ -432,6 +433,7 @@ class EpubPanel(QWidget):
 
     def _on_book_done(self, paths: list[str]) -> None:
         self._set_busy(False)
+        self._notify_model("ready")
         self._set_status(
             f"✓ livro narrado — <b>{len(paths)}</b> arquivo(s) em "
             f"<code>{self._outdir()}</code>")
@@ -439,14 +441,33 @@ class EpubPanel(QWidget):
 
     def _on_book_cancelled(self, paths: list[str]) -> None:
         self._set_busy(False)
+        self._notify_model("ready")
         self._set_status(
             f"⏹ cancelado — <b>{len(paths)}</b> capítulo(s) pronto(s) em "
             f"<code>{self._outdir()}</code>")
 
     def _on_book_failed(self, msg: str) -> None:
         self._set_busy(False)
+        self._notify_model("ready")
         self._set_status(f"❌ falha na narração — {msg}")
         self._log_append(f"❌ {msg}")
+
+    def _on_book_log(self, msg: str) -> None:
+        """Linha do motor: loga e repassa o estado do modelo ao app (barra de status)."""
+        self._log_append(msg)
+        if "carregando modelo" in msg:
+            self._notify_model("loading")
+        elif "modelo pronto" in msg:
+            self._notify_model("ready")
+
+    def _notify_model(self, state: str) -> None:
+        if self._model_hook is not None:
+            self._model_hook(state)
+
+    def set_model_hook(self, fn) -> None:
+        """Callback do app: ``fn('loading'|'ready')`` — mantém a barra de status
+        sincronizada quando a narração do livro carrega o Kokoro-82M."""
+        self._model_hook = fn
 
     def _on_cancel(self) -> None:
         if self._book_worker is not None:
