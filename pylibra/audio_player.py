@@ -41,8 +41,8 @@ class AudioPlayer(QWidget):
         self._seek = QSlider(Qt.Orientation.Horizontal)
         self._seek.setRange(0, 0)
         self._seek.setSingleStep(1000)
-        self._seek.setTracking(False)
-        self._seek.setToolTip("Arrastar para navegar")
+        # tracking ativo (padrão): valueChanged ao vivo durante o arraste → seek fluído
+        self._seek.setToolTip("Arrastar para navegar (seek)")
         self._vol = QSlider(Qt.Orientation.Horizontal)
         self._vol.setRange(0, 100)
         self._vol.setValue(100)
@@ -59,6 +59,7 @@ class AudioPlayer(QWidget):
         lay.addWidget(self._vol)
 
         self._play_btn.clicked.connect(self.toggle_play)
+        self._seek.valueChanged.connect(self._on_seek)  # arrastar a barra → setPosition
         self._player.positionChanged.connect(self._on_position)
         self._player.durationChanged.connect(self._on_duration)
         self._player.playbackStateChanged.connect(self._on_state)
@@ -96,6 +97,15 @@ class AudioPlayer(QWidget):
     # ------------------------------------------------------------- callbacks
     def _on_state(self, state: QMediaPlayer.PlaybackState) -> None:
         self._play_btn.setText("⏸" if state == QMediaPlayer.PlaybackState.PlayingState else "▶")
+
+    def _on_seek(self, ms: int) -> None:
+        """Arraste da barra → posiciona o player (seek). Ignorado antes da duração.
+
+        O _on_position já não move a barra enquanto o cursor está preso
+        (isSliderDown), então não há conflito entre seek e atualização de tempo.
+        """
+        if self._seek.maximum() > 0:
+            self._player.setPosition(int(ms))
 
     def _on_position(self, ms: int) -> None:
         if not self._seek.isSliderDown():
